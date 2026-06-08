@@ -57,11 +57,9 @@ jobs:
         id: get_run_id
         run: |
           RUN_ID=$(python -c "
-          import os, json
+          import os
 
           mlruns_path = 'MLProject/mlruns'
-
-          # Cari semua run di semua experiment
           latest_run_id = None
           latest_time = 0
 
@@ -74,15 +72,13 @@ jobs:
                   if not os.path.exists(meta_path):
                       continue
                   with open(meta_path) as f:
-                      content = f.read()
-                  # Ambil start_time dari meta.yaml
-                  for line in content.splitlines():
-                      if 'start_time' in line:
-                          t = int(line.split(':')[1].strip())
-                          if t > latest_time:
-                              latest_time = t
-                              latest_run_id = run_id
-                          break
+                      for line in f:
+                          if 'start_time' in line:
+                              t = int(line.split(':')[1].strip())
+                              if t > latest_time:
+                                  latest_time = t
+                                  latest_run_id = run_id
+                              break
 
           print(latest_run_id)
           ")
@@ -95,48 +91,19 @@ jobs:
           pip install requests
 
       - name: Upload to Google Drive
-        run: |
-          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
-          python -c "
-          import os, json
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
-          from google.oauth2 import service_account
-
-          creds_json = json.loads(os.environ['GDRIVE_CREDENTIALS'])
-          creds = service_account.Credentials.from_service_account_info(
-              creds_json,
-              scopes=['https://www.googleapis.com/auth/drive']
-          )
-          service = build('drive', 'v3', credentials=creds)
-          folder_id = os.environ['GDRIVE_FOLDER_ID']
-          run_id    = os.environ['RUN_ID']
-
-          artifact_path = f'MLProject/mlruns'
-
-          uploaded = 0
-          for root, dirs, files in os.walk(artifact_path):
-              for filename in files:
-                  filepath = os.path.join(root, filename)
-                  file_metadata = {'name': f'{run_id}_{filename}', 'parents': [folder_id]}
-                  media = MediaFileUpload(filepath, resumable=True)
-                  result = service.files().create(
-                      body=file_metadata, media_body=media, fields='id'
-                  ).execute()
-                  print(f'Uploaded: {filename} -> {result.get(\"id\")}')
-                  uploaded += 1
-
-          print(f'Total uploaded: {uploaded} files')
-          "
-        env:
-          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          RUN_ID: ${{ env.RUN_ID }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-artifacts-${{ env.RUN_ID }}
+          path: MLProject/mlruns/
+          retention-days: 30
 
       - name: Build Docker Model
         run: |
+          # Cari path artifacts model
+          MODEL_PATH=$(find MLProject/mlruns -type d -name "model" | head -1)
+          echo "Model path: $MODEL_PATH"
           mlflow models build-docker \
-            --model-uri "MLProject/mlruns/0/${{ env.RUN_ID }}/artifacts/model" \
+            --model-uri "$MODEL_PATH" \
             --name "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model"
 
       - name: Log in to Docker Hub
@@ -159,4 +126,4 @@ jobs:
         run: |
           docker push "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:latest"
           docker push "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:${{ github.sha }}"
-          echo "Pushed to: https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model"
+          echo "Pushed: https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model"
