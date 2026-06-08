@@ -1,0 +1,180 @@
+name: MLflow CI - Train & Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'MLProject/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+    inputs:
+      n_estimators:
+        description: 'Jumlah estimator Random Forest'
+        required: false
+        default: '100'
+
+jobs:
+  train-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────
+      - name: Run actions/checkout@v3
+        uses: actions/checkout@v3
+
+      # ── 2. Setup Python ──────────────────────────────────────
+      - name: Set up Python 3.12.7
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12.7'
+
+      # ── 3. Check Env ─────────────────────────────────────────
+      - name: Check Env
+        run: |
+          python --version
+          pip --version
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la
+
+      # ── 4. Install dependencies ──────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install mlflow==2.19.0 \
+                      scikit-learn \
+                      pandas \
+                      numpy \
+                      matplotlib \
+                      seaborn \
+                      dagshub \
+                      google-api-python-client \
+                      google-auth-httplib2 \
+                      google-auth-oauthlib
+
+      # ── 5. Run mlflow project ────────────────────────────────
+      - name: Run mlflow project
+        run: |
+          cd MLProject
+          mlflow run . \
+            --env-manager=local \
+            -P n_estimators=${{ github.event.inputs.n_estimators || '100' }} \
+            -P random_state=42 \
+            -P test_size=0.2
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
+      # ── 6. Get latest MLflow run_id ──────────────────────────
+      - name: Get latest MLflow run_id
+        id: get_run_id
+        run: |
+          RUN_ID=$(python -c "
+          import mlflow, os
+          os.environ['MLFLOW_TRACKING_URI'] = '${{ secrets.MLFLOW_TRACKING_URI }}'
+          os.environ['MLFLOW_TRACKING_USERNAME'] = '${{ secrets.MLFLOW_TRACKING_USERNAME }}'
+          os.environ['MLFLOW_TRACKING_PASSWORD'] = '${{ secrets.MLFLOW_TRACKING_PASSWORD }}'
+          client = mlflow.tracking.MlflowClient()
+          exp = client.get_experiment_by_name('Customer-Churn-CI')
+          runs = client.search_runs(exp.experiment_id, order_by=['start_time DESC'], max_results=1)
+          print(runs[0].info.run_id)
+          ")
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Latest MLflow run_id: $RUN_ID"
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
+      # ── 7. Install Python dependencies (for artifact export) ─
+      - name: Install Python dependencies
+        run: |
+          pip install requests pyarrow
+
+      # ── 8. Upload to Google Drive ────────────────────────────
+      - name: Upload to Google Drive
+        run: |
+          python -c "
+          import mlflow, os, json
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          from google.oauth2 import service_account
+
+          # Setup Google Drive credentials dari secret
+          creds_json = json.loads(os.environ['GDRIVE_CREDENTIALS'])
+          creds = service_account.Credentials.from_service_account_info(
+              creds_json,
+              scopes=['https://www.googleapis.com/auth/drive']
+          )
+          service = build('drive', 'v3', credentials=creds)
+          folder_id = os.environ['GDRIVE_FOLDER_ID']
+
+          # Download artifacts dari MLflow
+          os.environ['MLFLOW_TRACKING_URI']       = '${{ secrets.MLFLOW_TRACKING_URI }}'
+          os.environ['MLFLOW_TRACKING_USERNAME']  = '${{ secrets.MLFLOW_TRACKING_USERNAME }}'
+          os.environ['MLFLOW_TRACKING_PASSWORD']  = '${{ secrets.MLFLOW_TRACKING_PASSWORD }}'
+
+          client = mlflow.tracking.MlflowClient()
+          run_id = os.environ['RUN_ID']
+          local_path = client.download_artifacts(run_id, '', './artifacts')
+          print(f'Artifacts downloaded to: {local_path}')
+
+          # Upload semua file artifact ke Google Drive
+          import os as _os
+          for root, dirs, files in _os.walk('./artifacts'):
+              for filename in files:
+                  filepath = _os.path.join(root, filename)
+                  file_metadata = {'name': filename, 'parents': [folder_id]}
+                  media = MediaFileUpload(filepath, resumable=True)
+                  uploaded = service.files().create(
+                      body=file_metadata, media_body=media, fields='id'
+                  ).execute()
+                  print(f'Uploaded {filename} -> Drive ID: {uploaded.get(\"id\")}')
+
+          print('Upload to Google Drive selesai!')
+          "
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          RUN_ID: ${{ env.RUN_ID }}
+
+      # ── 9. Build Docker Model ─────────────────────────────────
+      - name: Build Docker Model
+        run: |
+          mlflow models build-docker \
+            --model-uri "runs:/${{ env.RUN_ID }}/model" \
+            --name "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model"
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+
+      # ── 10. Log in to Docker Hub ──────────────────────────────
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── 11. Tag Docker Image ──────────────────────────────────
+      - name: Tag Docker Image
+        run: |
+          docker tag \
+            "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model" \
+            "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:latest"
+          docker tag \
+            "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model" \
+            "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:${{ github.sha }}"
+          echo "Image tagged: latest & ${{ github.sha }}"
+
+      # ── 12. Push Docker Image ─────────────────────────────────
+      - name: Push Docker Image
+        run: |
+          docker push "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:latest"
+          docker push "${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model:${{ github.sha }}"
+          echo "Docker Hub: https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/customer-churn-model"
